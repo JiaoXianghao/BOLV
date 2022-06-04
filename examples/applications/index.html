@@ -1087,6 +1087,190 @@ b_optimizer.build_ul_solver(x_opt)
 </code></pre>
 <hr />
 <h2 id="gan">GAN</h2>
+<p>Define data generator:</p>
+<pre><code>class data_generator(object):
+    def __init__(self,dis='normal',n=8,std=0.02,radius=2):
+
+        # n = 8      #8
+        # radius = 2
+        # std = 0.02 #0.02
+        delta_theta = 2*np.pi / n
+
+        centers_x = []
+        centers_y = []
+        for i in range(n):
+            centers_x.append(radius*np.cos(i*delta_theta))
+            centers_y.append(radius*np.sin(i*delta_theta))
+
+        centers_x = np.expand_dims(np.array(centers_x), 1)
+        centers_y = np.expand_dims(np.array(centers_y), 1)
+
+        p = [1./n for _ in range(n)]
+
+        self.p = p
+        self.size = 2
+        self.n = n
+        self.dis=dis
+
+        self.centers = np.concatenate([centers_x, centers_y], 1)
+        self.std = std
+
+    # switch to random distribution (harder)
+    def random_distribution(self, p=None):
+        if p is None:
+            p = [np.random.uniform() for _ in range(self.n)]
+            p = p / np.sum(p)
+        self.p = p
+
+    # switch to uniform distribution
+    def uniform_distribution(self):
+        p = [1./self.n for _ in range(self.n)]
+        self.p = p
+
+    def sample(self, N,center_require=False):
+        n = self.n
+        std = self.std
+        centers = self.centers
+
+        ith_center = np.random.choice(n, N,p=self.p)
+        sample_centers = centers[ith_center, :]
+        if self.dis=='normal':
+            sample_points = np.random.normal(loc=sample_centers, scale=std)
+        elif self.dis=='laplace':
+            sample_points = scipy.stats.laplace.rvs(loc=sample_centers,scale=std)
+        if center_require:
+            return sample_points.astype('float32'),ith_center
+        else:
+            return sample_points.astype('float32')
+</code></pre>
+<p>Define LL and UL objective:</p>
+<pre><code>def ll_objective(data, target, ul_model, ll_model):
+    d_real_data, d_fake_data = data
+    d_fake_decision = ll_model(d_fake_data)
+    fake_target = torch.zeros_like(d_fake_decision)
+    if cuda:
+        fake_target = fake_target.cuda()
+    d_fake_error = criterion(d_fake_decision, fake_target)  # zeros = fake
+
+    d_real_decision = ll_model(d_real_data)
+    real_target = torch.ones_like(d_real_decision)
+    if cuda:
+        real_target = real_target.cuda()
+    d_real_error = criterion(d_real_decision, real_target)  # ones = true
+
+    d_loss = d_real_error + d_fake_error
+    return d_loss
+
+
+def ul_objective(data, target, ul_model, ll_model):
+    g_fake_data = ul_model(data)
+    dg_fake_decision = ll_model(g_fake_data)
+    target = torch.ones_like(dg_fake_decision)
+    if cuda:
+        target = target.cuda()
+    g_error = criterion(dg_fake_decision, target)
+    return g_error
+</code></pre>
+<p>Define LL and UL model along with their opts:</p>
+<pre><code>class Generator(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size):
+        super(Generator, self).__init__()
+        self.map1 = nn.Linear(input_size, hidden_size)
+        self.map2 = nn.Linear(hidden_size, hidden_size)
+        self.map3 = nn.Linear(hidden_size, output_size)
+        # self.activation_fn = F.tanh
+        self.activation_fn = F.relu
+
+    def forward(self, x):
+        x = self.activation_fn(self.map1(x))
+        x = self.activation_fn(self.map2(x))
+        return self.map3(x)
+
+
+    class Discriminator(nn.Module):
+        def __init__(self, input_size, hidden_size, output_size):
+            super(Discriminator, self).__init__()
+            self.map1 = nn.Linear(input_size, hidden_size)
+            self.map2 = nn.Linear(hidden_size, hidden_size)
+            self.map3 = nn.Linear(hidden_size, output_size)
+            self.activation_fn = F.relu
+
+    def forward(self, x):
+        x = self.activation_fn(self.map1(x))
+        x = self.activation_fn(self.map2(x))
+        return torch.sigmoid(self.map3(x))
+
+    def load(self, backup):
+        for m_from, m_to in zip(backup.modules(), self.modules()):
+            if isinstance(m_to, nn.Linear):
+                m_to.weight.data = m_from.weight.data.clone()
+                if m_to.bias is not None:
+                    m_to.bias.data = m_from.bias.data.clone()
+
+ul_model = Generator(input_size=g_inp, hidden_size=g_hid, output_size=g_out)
+ll_model = Discriminator(input_size=d_inp, hidden_size=d_hid, output_size=d_out)
+
+ll_opt = optim.Adam(ll_model.parameters(), lr=d_learning_rate)
+ul_opt = optim.Adam(ul_model.parameters(), lr=g_learning_rate)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+ll_model.to(device)
+ul_model.to(device)
+</code></pre>
+<p>Define Bi-level optimizer:</p>
+<pre><code>optimizer = bolv.optimizer.BOLVOptimizer(
+            "Feature", ll_method="Dynamic", ul_method="Recurrence",
+            ll_objective=ll_objective, ul_objective=ul_objective,
+            ll_model=ll_model, ul_model=ul_model, total_iters=3000)
+optimizer.build_ll_solver(10, ll_opt)
+optimizer.build_ul_solver(ul_opt)
+</code></pre>
+<p>Train model:</p>
+<pre><code>def noise_sampler(N, z_dim):
+    return np.random.normal(size=[N, z_dim]).astype('float32')
+
+criterion = nn.BCELoss()
+
+for rhg in range(1):
+    def g_sample():
+        with torch.no_grad():
+            gen_input = torch.from_numpy(noise_sampler(minibatch_size, g_inp))
+            if cuda:
+                gen_input = gen_input.cuda()
+            g_fake_data = ul_model(gen_input)
+            return g_fake_data.cpu().numpy()
+    samples = []
+    g_infos = []
+    for it in tqdm_notebook(range(num_iterations)):
+        gen_input = torch.from_numpy(noise_sampler(minibatch_size, g_inp))
+        if cuda:
+            gen_input = gen_input.cuda()
+        #  1A: Train D on real
+        d_real_data = torch.from_numpy(dset.sample(minibatch_size))
+        if cuda:
+            d_real_data = d_real_data.cuda()
+        #  1B: Train D on fake
+        d_gen_input = torch.from_numpy(noise_sampler(minibatch_size, g_inp))
+        if cuda:
+            d_gen_input = d_gen_input.cuda()
+        with torch.no_grad():
+            d_fake_data = ul_model(d_gen_input)
+
+        for i in range(1):
+            ll_opt.zero_grad()
+            d_loss = ll_objective([d_real_data, d_fake_data], None, ul_model, ll_model)
+            d_loss.backward()
+            ll_opt.step()
+        g_info, forward_time, backward_time = optimizer.run_iter([d_real_data, d_fake_data], None, gen_input, None,
+                                                                   it, forward_with_whole_batch=True)
+
+        if it % log_interval == 0:
+            g_fake_data = g_sample()
+            samples.append(g_fake_data)
+            print(g_info, KL(samples[-1]))
+
+    plot_samples(samples)
+</code></pre>
 
               
             </article>
