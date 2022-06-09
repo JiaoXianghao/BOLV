@@ -1087,6 +1087,23 @@ b_optimizer.build_ul_solver(x_opt)
 </code></pre>
 <hr />
 <h2 id="gan">GAN</h2>
+<p>Desired packages:</p>
+<pre><code>import os
+import numpy as np
+import matplotlib.pyplot as plt
+
+import seaborn
+from tqdm import tqdm_notebook
+import random
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import scipy
+
+import bolv
+</code></pre>
 <p>Define data generator:</p>
 <pre><code>class data_generator(object):
     def __init__(self,dis='normal',n=8,std=0.02,radius=2):
@@ -1142,6 +1159,79 @@ b_optimizer.build_ul_solver(x_opt)
             return sample_points.astype('float32'),ith_center
         else:
             return sample_points.astype('float32')
+
+## choose uniform mixture gaussian or weighted mixture gaussian
+dset = data_generator()
+# dset.random_distribution()
+dset.uniform_distribution()
+</code></pre>
+<p>Plot function and KL function and other settings:</p>
+<pre><code># plot the samples through iterations
+def plot_samples(samples):
+    xmax = 5
+    cols = len(samples)
+    bg_color = seaborn.color_palette('Greens', n_colors=256)[0]
+    plt.figure(figsize=(2 * cols, 2))
+    for i, samps in enumerate(samples):
+        if i == 0:
+            ax = plt.subplot(1, cols, 1)
+        else:
+            plt.subplot(1, cols, i + 1, sharex=ax, sharey=ax)
+        ax2 = seaborn.kdeplot(samps[:, 0], samps[:, 1], shaded=True, cmap='Greens', n_levels=20,
+                              clip=[[-xmax, xmax]] * 2)
+        plt.xticks([])
+        plt.yticks([])
+        plt.title('step %d' % (i * 300))
+
+    ax.set_ylabel('%d unrolling steps' % 10)
+    plt.gcf().tight_layout()
+    plt.savefig('target.png')
+    plt.show()
+    plt.close()
+
+def KL(samples, d=-1):
+    n = 8
+    radius = 2
+    std = 0.02
+    delta_theta = 2 * np.pi / n
+
+    centers_x = []
+    centers_y = []
+    for i in range(n):
+        centers_x.append(radius * np.cos(i * delta_theta))
+        centers_y.append(radius * np.sin(i * delta_theta))
+
+    centers_x = np.expand_dims(np.array(centers_x), 1)
+    centers_y = np.expand_dims(np.array(centers_y), 1)
+    centers = np.concatenate([centers_x, centers_y], 1)
+
+    s = samples
+    samplesP = np.zeros(s.shape[0])
+    for i in range(n):
+        samplesP = samplesP + scipy.stats.multivariate_normal.pdf(samples, centers[i], [[std, 0], [0, std]]) / 8
+
+    samplesP=samplesP/sum(samplesP)
+    pd =np.log(samplesP / (1/float(s.shape[0]))) * samplesP
+
+    KL = np.sum(pd)
+    return KL
+
+def setup_seed(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+# 设置随机数种子
+setup_seed(30)
+
+if torch.cuda.is_available():
+    cuda = True
+    os.environ['CUDA_VISIBLE_DEVICES'] = "0"
+else:
+    cuda = False
+
+plt.style.use('ggplot')
 </code></pre>
 <p>Define LL and UL objective:</p>
 <pre><code>def ll_objective(data, target, ul_model, ll_model):
@@ -1207,11 +1297,11 @@ def ul_objective(data, target, ul_model, ll_model):
                 if m_to.bias is not None:
                     m_to.bias.data = m_from.bias.data.clone()
 
-ul_model = Generator(input_size=g_inp, hidden_size=g_hid, output_size=g_out)
-ll_model = Discriminator(input_size=d_inp, hidden_size=d_hid, output_size=d_out)
+ul_model = Generator(input_size=256, hidden_size=128, output_size=dset.size)
+ll_model = Discriminator(input_size=dset.size, hidden_size=128, output_size=1)
 
-ll_opt = optim.Adam(ll_model.parameters(), lr=d_learning_rate)
-ul_opt = optim.Adam(ul_model.parameters(), lr=g_learning_rate)
+ll_opt = optim.Adam(ll_model.parameters(), lr=1e-4)
+ul_opt = optim.Adam(ul_model.parameters(), lr=1e-4)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 ll_model.to(device)
@@ -1234,23 +1324,23 @@ criterion = nn.BCELoss()
 for rhg in range(1):
     def g_sample():
         with torch.no_grad():
-            gen_input = torch.from_numpy(noise_sampler(minibatch_size, g_inp))
+            gen_input = torch.from_numpy(noise_sampler(512, 256))
             if cuda:
                 gen_input = gen_input.cuda()
             g_fake_data = ul_model(gen_input)
             return g_fake_data.cpu().numpy()
     samples = []
     g_infos = []
-    for it in tqdm_notebook(range(num_iterations)):
-        gen_input = torch.from_numpy(noise_sampler(minibatch_size, g_inp))
+    for it in tqdm_notebook(range(3000)):
+        gen_input = torch.from_numpy(noise_sampler(512, 256))
         if cuda:
             gen_input = gen_input.cuda()
         #  1A: Train D on real
-        d_real_data = torch.from_numpy(dset.sample(minibatch_size))
+        d_real_data = torch.from_numpy(dset.sample(512))
         if cuda:
             d_real_data = d_real_data.cuda()
         #  1B: Train D on fake
-        d_gen_input = torch.from_numpy(noise_sampler(minibatch_size, g_inp))
+        d_gen_input = torch.from_numpy(noise_sampler(512, 256))
         if cuda:
             d_gen_input = d_gen_input.cuda()
         with torch.no_grad():
